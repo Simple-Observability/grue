@@ -79,3 +79,7 @@ Environment variables take priority over the config file. The `AWS_*` variables 
 | `GRUE_CONFIG`     | Path to the config file      |
 
 The config file is at `~/.config/grue/config.json` by default. Override the path with `GRUE_CONFIG`.
+
+### Limitations
+
+- **No blob garbage collection.** `rm` deletes tags only; the blobs they referenced are retained. A future `gc`/`prune` command is planned.

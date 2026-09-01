@@ -1,0 +1,130 @@
+name: Build
+
+on:
+  push:
+    branches: ["*"]
+    tags: ["*"]
+  pull_request:
+
+jobs:
+  # ------------------------------------------------------------------
+  # Lint
+  # ------------------------------------------------------------------
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: ./go.mod
+          cache-dependency-path: ./go.sum
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.5
+
+  # ------------------------------------------------------------------
+  # Unit Tests
+  # ------------------------------------------------------------------
+  test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: ./go.mod
+          cache-dependency-path: ./go.sum
+      - name: Run unit tests
+        run: |
+          go test -v -coverprofile=coverage.txt ./...
+          go tool cover -func=coverage.txt
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: coverage
+          path: coverage.txt
+          if-no-files-found: ignore
+
+  # ------------------------------------------------------------------
+  # Build
+  # ------------------------------------------------------------------
+  build:
+    name: Build (${{ matrix.os }}/${{ matrix.arch }})
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04,     os: linux,   arch: amd64 }
+          - { runner: ubuntu-24.04-arm,  os: linux,   arch: arm64 }
+          - { runner: macos-13,          os: darwin,  arch: amd64 }
+          - { runner: macos-14,          os: darwin,  arch: arm64 }
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: ./go.mod
+          cache-dependency-path: ./go.sum
+
+      - name: Set environment
+        run: |
+          EXT=""
+          if [[ "${{ matrix.os }}" == "windows" ]]; then EXT=".exe"; fi
+          echo "BINARY_NAME=grue-${{ matrix.os }}-${{ matrix.arch }}${EXT}" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: |
+          go build -trimpath -ldflags="-s -w" -o "${BINARY_NAME}" .
+
+      - name: Smoke test
+        run: ./"${BINARY_NAME}" --help
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: grue-${{ matrix.os }}-${{ matrix.arch }}
+          path: ./${{ env.BINARY_NAME }}
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------
+  # Release
+  # ------------------------------------------------------------------
+  release:
+    name: Release
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: artifacts
+          pattern: grue-*
+
+      - name: Collect binaries
+        run: |
+          mkdir -p dist
+          find artifacts -type f -name 'grue-*' -exec mv {} dist/ \;
+          ls -l dist/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Release ${{ github.ref_name }}
+          files: dist/*
