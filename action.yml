@@ -1,0 +1,131 @@
+name: 'grue build and push'
+description: 'Build a Docker image with docker/build-push-action and push it to S3-compatible storage using grue.'
+author: 'Simple Observability'
+
+inputs:
+  # Build (passed through to docker/build-push-action)
+  context:
+    description: 'Build context directory'
+    default: '.'
+  file:
+    description: 'Path to the Dockerfile, relative to the context'
+    default: './Dockerfile'
+  tags:
+    description: |
+      Newline-delimited list of image references to build and push.
+      Example:
+        myimage:latest
+        myimage:${{ github.ref_name }}
+    required: true
+  build-args:
+    description: 'Newline-delimited list of build-time variables (passed to docker/build-push-action)'
+    default: ''
+  target:
+    description: 'Set the target build stage to build'
+    default: ''
+  platform:
+    description: 'Target platform (e.g. linux/amd64). Single platform only — grue stores one image per tag.'
+    default: ''
+  cache-from:
+    description: 'List of cache sources (passed to docker/build-push-action)'
+    default: ''
+  cache-to:
+    description: 'Cache destinations (passed to docker/build-push-action)'
+    default: ''
+  # S3 configuration
+  endpoint:
+    description: 'S3 endpoint URL (e.g. s3.amazonaws.com)'
+    default: ''
+  region:
+    description: 'S3 region (e.g. us-east-1; blank if unused)'
+    default: ''
+  bucket:
+    description: 'S3 bucket name'
+    default: ''
+  prefix:
+    description: 'Key prefix inside the bucket (default grue/)'
+    default: ''
+  access-key:
+    description: 'S3 access key'
+    default: ''
+  secret-key:
+    description: 'S3 secret key'
+    default: ''
+
+  grue-version:
+    description: 'grue binary version to download from GitHub releases (default: latest)'
+    default: 'latest'
+
+runs:
+  using: composite
+  steps:
+    # Build the image using docker/build-push-action
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v4
+
+    - name: Build image
+      uses: docker/build-push-action@v7
+      with:
+        context: ${{ inputs.context }}
+        file: ${{ inputs.file }}
+        tags: ${{ inputs.tags }}
+        build-args: ${{ inputs.build-args }}
+        target: ${{ inputs.target }}
+        platforms: ${{ inputs.platform }}
+        cache-from: ${{ inputs.cache-from }}
+        cache-to: ${{ inputs.cache-to }}
+        push: false
+        load: true
+
+    # Download the grue binary
+    - name: Download grue
+      shell: bash
+      env:
+        GRUE_VERSION_INPUT: ${{ inputs.grue-version }}
+      run: |
+        set -eu
+        os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+        arch="$(uname -m)"
+        case "$arch" in
+          x86_64|amd64) arch=amd64 ;;
+          aarch64|arm64) arch=arm64 ;;
+        esac
+
+        # Resolve "latest" to an actual tag via the GitHub API.
+        if [[ "$GRUE_VERSION_INPUT" == "latest" ]]; then
+          tag="$(curl -fsSL https://api.github.com/repos/Simple-Observability/grue/releases/latest | grep -oP '"tag_name":\s*"\K[^"]+')"
+        else
+          tag="$GRUE_VERSION_INPUT"
+        fi
+
+        asset="grue-${os}-${arch}"
+        url="https://github.com/Simple-Observability/grue/releases/download/${tag}/${asset}"
+
+        echo "Downloading grue ${tag} (${os}/${arch})…"
+        curl -fsSL -o /usr/local/bin/grue "$url"
+        chmod +x /usr/local/bin/grue
+        grue --help >/dev/null
+        echo "grue ${tag} installed."
+
+    # Push each tag to the bucket with grue
+    - name: Push with grue
+      shell: bash
+      env:
+        TAGS: ${{ inputs.tags }}
+        # Map inputs → GRUE_* env vars (input takes priority over a pre-set env).
+        GRUE_ENDPOINT: ${{ inputs.endpoint }}
+        GRUE_REGION: ${{ inputs.region }}
+        GRUE_BUCKET: ${{ inputs.bucket }}
+        GRUE_PREFIX: ${{ inputs.prefix }}
+        GRUE_ACCESS_KEY: ${{ inputs.access-key }}
+        GRUE_SECRET_KEY: ${{ inputs.secret-key }}
+      run: |
+        set -eu
+        mapfile -t tag_lines <<<"$TAGS"
+        for line in "${tag_lines[@]}"; do
+          t="$(echo "$line" | xargs)"
+          [[ -z "$t" ]] && continue
+          echo "::group::grue push $t"
+          grue push "$t"
+          echo "::endgroup::"
+        done
