@@ -15,7 +15,7 @@ inputs:
       Newline-delimited list of image references to build and push.
       Example:
         myimage:latest
-        myimage:${{ github.ref_name }}
+        myimage:1.0.0
     required: true
   build-args:
     description: 'Newline-delimited list of build-time variables (passed to docker/build-push-action)'
