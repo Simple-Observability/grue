@@ -76,10 +76,12 @@ runs:
       shell: bash
       env:
         GH_TOKEN: ${{ github.token }}
+        ACTION_REPO: ${{ github.action_repository }}
+        ACTION_REF: ${{ github.action_ref }}
       run: |
         set -eu
-        repo="${GITHUB_ACTION_REPOSITORY}"
-        ref="${GITHUB_ACTION_REF}"
+        repo="${ACTION_REPO}"
+        ref="${ACTION_REF}"
 
         os="$(uname -s | tr '[:upper:]' '[:lower:]')"
         arch="$(uname -m)"
