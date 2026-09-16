@@ -3,7 +3,7 @@ name: Build
 on:
   push:
     branches: ["*"]
-    tags: ["*"]
+    tags: ["v*.*.*"]
   pull_request:
 
 jobs:
@@ -127,3 +127,11 @@ jobs:
           tag_name: ${{ github.ref_name }}
           name: Release ${{ github.ref_name }}
           files: dist/*
+
+      - name: Point major tag at this release
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          major="${tag%%.*}"
+          echo "Moving ${major} -> ${tag}"
+          git tag -f "$major" "$tag"
+          git push -f origin "$major"
