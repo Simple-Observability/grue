@@ -1,0 +1,22 @@
+name: Move major tag
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  retag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Point major tag at the new release
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          major="${tag%%.*}"
+          echo "Moving ${major} -> ${tag}"
+          git tag -f "$major" "$tag"
+          git push -f origin "$major"

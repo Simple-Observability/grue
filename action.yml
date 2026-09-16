@@ -43,8 +43,8 @@ inputs:
     description: 'S3 bucket name'
     default: ''
   prefix:
-    description: 'Key prefix inside the bucket (default grue/)'
-    default: ''
+    description: 'Key prefix inside the bucket (default: grue/)'
+    default: 'grue/'
   access-key:
     description: 'S3 access key'
     default: ''
@@ -52,14 +52,9 @@ inputs:
     description: 'S3 secret key'
     default: ''
 
-  grue-version:
-    description: 'grue binary version to download from GitHub releases (default: latest)'
-    default: 'latest'
-
 runs:
   using: composite
   steps:
-    # Build the image using docker/build-push-action
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v4
 
@@ -77,13 +72,15 @@ runs:
         push: false
         load: true
 
-    # Download the grue binary
     - name: Download grue
       shell: bash
       env:
-        GRUE_VERSION_INPUT: ${{ inputs.grue-version }}
+        GH_TOKEN: ${{ github.token }}
       run: |
         set -eu
+        repo="${GITHUB_ACTION_REPOSITORY}"
+        ref="${GITHUB_ACTION_REF}"
+
         os="$(uname -s | tr '[:upper:]' '[:lower:]')"
         arch="$(uname -m)"
         case "$arch" in
@@ -91,23 +88,30 @@ runs:
           aarch64|arm64) arch=arm64 ;;
         esac
 
-        # Resolve "latest" to an actual tag via the GitHub API.
-        if [[ "$GRUE_VERSION_INPUT" == "latest" ]]; then
-          tag="$(curl -fsSL https://api.github.com/repos/Simple-Observability/grue/releases/latest | grep -oP '"tag_name":\s*"\K[^"]+')"
-        else
-          tag="$GRUE_VERSION_INPUT"
+        # Resolve the ref to a release tag. Exact release tags (vX.Y.Z)
+        # and major tags (vX) are supported.
+        tag="$ref"
+        if ! gh release view "$tag" --repo "$repo" >/dev/null 2>&1; then
+          if ! [[ "$ref" =~ ^v?[0-9]+$ ]]; then
+            echo "::error::Ref '${ref}' of ${repo} is not a release tag (vX.Y.Z) or major tag (vX). Pin the action to a release or major tag." >&2
+            exit 1
+          fi
+          tag="$(gh api "repos/${repo}/releases?per_page=100" \
+            --jq "[.[] | select(.draft == false and .prerelease == false)]
+                  | sort_by(.created_at) | reverse
+                  | map(select(.tag_name | startswith(\"${ref}.\"))) | .[0].tag_name")"
+          if [[ -z "$tag" ]]; then
+            echo "::error::No stable release found for major tag '${ref}' in ${repo}" >&2
+            exit 1
+          fi
         fi
+        echo "Using grue release: ${tag} (ref: ${ref})"
 
-        asset="grue-${os}-${arch}"
-        url="https://github.com/Simple-Observability/grue/releases/download/${tag}/${asset}"
-
-        echo "Downloading grue ${tag} (${os}/${arch})…"
-        curl -fsSL -o /usr/local/bin/grue "$url"
+        gh release download "$tag" --repo "$repo" \
+          --pattern "grue-${os}-${arch}" --output /usr/local/bin/grue
         chmod +x /usr/local/bin/grue
         grue --help >/dev/null
-        echo "grue ${tag} installed."
 
-    # Push each tag to the bucket with grue
     - name: Push with grue
       shell: bash
       env:
