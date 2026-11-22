@@ -30,7 +30,6 @@ import (
 	"golang.org/x/term"
 )
 
-
 // -----------------------------------------------------------------------------
 // Main
 // -----------------------------------------------------------------------------
@@ -203,7 +202,7 @@ func newStore(cfg *Config) (*store, error) {
 	return &store{client: client, bucket: cfg.Bucket, prefix: cfg.Prefix}, nil
 }
 
-func (s *store) blobKey(digest string) string   { return s.prefix + "blobs/" + digest }
+func (s *store) blobKey(digest string) string { return s.prefix + "blobs/" + digest }
 
 func (s *store) tagKey(name, tag string) string { return s.prefix + "repos/" + name + "/tags/" + tag }
 
@@ -304,6 +303,9 @@ func newDockerClient() (*dockerClient, error) {
 	}
 	tr := &http.Transport{
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			if network == "npipe" {
+				return dialDockerPipe(ctx, addr)
+			}
 			var d net.Dialer
 			return d.DialContext(ctx, network, addr)
 		},
@@ -329,6 +331,10 @@ func dockerEndpoint() (network, addr, base string, err error) {
 	case strings.HasPrefix(h, "tcp://"):
 		addr = strings.TrimPrefix(h, "tcp://")
 		return "tcp", addr, "http://" + addr, nil
+	case strings.HasPrefix(h, "npipe://"):
+		addr = strings.TrimPrefix(h, "npipe://")
+		addr = strings.ReplaceAll(addr, "/", `\`)
+		return "npipe", addr, "http://docker", nil
 	default:
 		return "", "", "", fmt.Errorf("unsupported DOCKER_HOST %q", h)
 	}

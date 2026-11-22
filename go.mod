@@ -1,8 +1,9 @@
 module grue
 
-go 1.24
+go 1.26.0
 
 require (
+	github.com/Microsoft/go-winio v0.6.4
 	github.com/distribution/reference v0.6.0
 	github.com/minio/minio-go/v7 v7.0.74
 	github.com/opencontainers/go-digest v1.0.0
@@ -22,7 +23,7 @@ require (
 	github.com/rs/xid v1.5.0 // indirect
 	golang.org/x/crypto v0.24.0 // indirect
 	golang.org/x/net v0.26.0 // indirect
-	golang.org/x/sys v0.29.0 // indirect
+	golang.org/x/sys v0.49.0 // indirect
 	golang.org/x/text v0.16.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
