@@ -1,10 +1,16 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -94,10 +100,10 @@ func TestResolveConfig(t *testing.T) {
 
 	// Seed a file config.
 	if err := saveConfig(&Config{
-		Endpoint: "file.example.com",
-		Region:   "file-region",
-		Bucket:   "file-bucket",
-		Prefix:   "fileprefix",
+		Endpoint:  "file.example.com",
+		Region:    "file-region",
+		Bucket:    "file-bucket",
+		Prefix:    "fileprefix",
 		AccessKey: "file-ak",
 		SecretKey: "file-sk",
 	}); err != nil {
@@ -344,3 +350,580 @@ func TestDigestOf(t *testing.T) {
 	}
 }
 
+// -----------------------------------------------------------------------------
+// prune
+// -----------------------------------------------------------------------------
+
+// Reference Discovery
+
+func testManifest(config string, layers ...string) []byte {
+	m := imageManifest{
+		SchemaVersion: 2,
+		MediaType:     mediaTypeManifest,
+		Config:        descriptor{Digest: config},
+	}
+	for _, layer := range layers {
+		m.Layers = append(m.Layers, descriptor{Digest: layer})
+	}
+	data, _ := json.Marshal(m)
+	return data
+}
+
+type fakeTagSource struct {
+	keys    []string
+	data    map[string][]byte
+	listErr error
+	readErr map[string]error
+}
+
+type fakeBlobSource struct {
+	blobs []blobInfo
+	err   error
+}
+
+func (f *fakeTagSource) listTagKeys(ctx context.Context) ([]string, error) {
+	return f.keys, f.listErr
+}
+
+func (f *fakeTagSource) readTag(ctx context.Context, key string) ([]byte, error) {
+	if err := f.readErr[key]; err != nil {
+		return nil, err
+	}
+	data, ok := f.data[key]
+	if !ok {
+		return nil, errors.New("object not found")
+	}
+	return data, nil
+}
+
+func (f *fakeBlobSource) listBlobs(ctx context.Context) ([]blobInfo, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.blobs, nil
+}
+
+func TestDiscoverReferences(t *testing.T) {
+	config := "sha256:" + strings.Repeat("a", 64)
+	layer := "sha256:" + strings.Repeat("b", 64)
+	shared := "sha256:" + strings.Repeat("c", 64)
+
+	tests := []struct {
+		name    string
+		source  *fakeTagSource
+		want    map[string][]string
+		wantErr bool
+	}{
+		{
+			name: "multiple repositories and tags",
+			source: &fakeTagSource{
+				keys: []string{
+					"repos/one/tags/latest",
+					"repos/one/tags/v1",
+					"repos/two/tags/latest",
+				},
+				data: map[string][]byte{
+					"repos/one/tags/latest": testManifest(config, layer),
+					"repos/one/tags/v1":     testManifest(config),
+					"repos/two/tags/latest": testManifest(shared),
+				},
+			},
+			want: map[string][]string{
+				config: {"one:latest", "one:v1"},
+				layer:  {"one:latest"},
+				shared: {"two:latest"},
+			},
+		},
+		{
+			name:   "empty storage",
+			source: &fakeTagSource{data: map[string][]byte{}},
+			want:   map[string][]string{},
+		},
+		{
+			name: "malformed JSON",
+			source: &fakeTagSource{
+				keys: []string{"repos/one/tags/latest"},
+				data: map[string][]byte{
+					"repos/one/tags/latest": []byte("{"),
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "unsupported schema version",
+			source: &fakeTagSource{
+				keys: []string{"repos/one/tags/latest"},
+				data: map[string][]byte{
+					"repos/one/tags/latest": []byte(`{"schemaVersion":1,"mediaType":"application/vnd.oci.image.manifest.v1+json"}`),
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "unsupported media type",
+			source: &fakeTagSource{
+				keys: []string{"repos/one/tags/latest"},
+				data: map[string][]byte{
+					"repos/one/tags/latest": []byte(`{"schemaVersion":2,"mediaType":"unsupported"}`),
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "missing config digest",
+			source: &fakeTagSource{
+				keys: []string{"repos/one/tags/latest"},
+				data: map[string][]byte{
+					"repos/one/tags/latest": []byte(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{},"layers":[]}`),
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "invalid config digest",
+			source: &fakeTagSource{
+				keys: []string{"repos/one/tags/latest"},
+				data: map[string][]byte{
+					"repos/one/tags/latest": testManifest("invalid"),
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "invalid layer digest",
+			source: &fakeTagSource{
+				keys: []string{"repos/one/tags/latest"},
+				data: map[string][]byte{
+					"repos/one/tags/latest": testManifest(config, "invalid"),
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "listing failure",
+			source: &fakeTagSource{
+				listErr: errors.New("listing failed"),
+			},
+			wantErr: true,
+		},
+		{
+			name: "read failure",
+			source: &fakeTagSource{
+				keys: []string{"repos/one/tags/latest"},
+				readErr: map[string]error{
+					"repos/one/tags/latest": errors.New("read failed"),
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "invalid tag object key",
+			source: &fakeTagSource{
+				keys: []string{"repos/one/metadata"},
+				data: map[string][]byte{},
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := discoverReferences(context.Background(), tt.source, "")
+
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("discoverReferences() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if err != nil {
+				if got != nil {
+					t.Fatalf("discoverReferences() returned partial references: %v", got)
+				}
+				return
+			}
+
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("discoverReferences() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// Blob validation
+
+func TestValidateBlobs(t *testing.T) {
+	config := "sha256:" + strings.Repeat("a", 64)
+	layer := "sha256:" + strings.Repeat("b", 64)
+	orphan := "sha256:" + strings.Repeat("c", 64)
+	missing := "sha256:" + strings.Repeat("d", 64)
+
+	prefix := "test/"
+	configKey := prefix + "blobs/" + config
+	layerKey := prefix + "blobs/" + layer
+	orphanKey := prefix + "blobs/" + orphan
+
+	tests := []struct {
+		name        string
+		refs        map[string][]string
+		blobs       []blobInfo
+		want        []blobInfo
+		wantMissing map[string][]string
+		wantErr     bool
+	}{
+		{
+			name: "referenced and unreferenced blobs",
+			refs: map[string][]string{
+				config: {"one:latest"},
+				layer:  {"one:latest"},
+			},
+			blobs: []blobInfo{
+				{key: configKey, size: 100},
+				{key: layerKey, size: 200},
+				{key: orphanKey, size: 300},
+			},
+			want: []blobInfo{
+				{key: orphanKey, size: 300},
+			},
+			wantMissing: map[string][]string{},
+		},
+		{
+			name: "missing blob referenced by multiple tags",
+			refs: map[string][]string{
+				missing: {"one:latest", "two:v1"},
+			},
+			blobs: []blobInfo{
+				{key: orphanKey, size: 300},
+			},
+			want: []blobInfo{
+				{key: orphanKey, size: 300},
+			},
+			wantMissing: map[string][]string{
+				missing: {"one:latest", "two:v1"},
+			},
+		},
+		{
+			name: "missing config and layer blobs",
+			refs: map[string][]string{
+				config: {"one:latest"},
+				layer:  {"one:latest"},
+			},
+			blobs: []blobInfo{},
+			want:  []blobInfo{},
+			wantMissing: map[string][]string{
+				config: {"one:latest"},
+				layer:  {"one:latest"},
+			},
+		},
+		{
+			name: "empty references",
+			refs: map[string][]string{},
+			blobs: []blobInfo{
+				{key: orphanKey, size: 300},
+			},
+			want: []blobInfo{
+				{key: orphanKey, size: 300},
+			},
+			wantMissing: map[string][]string{},
+		},
+		{
+			name:        "empty references and blobs",
+			refs:        map[string][]string{},
+			blobs:       []blobInfo{},
+			want:        []blobInfo{},
+			wantMissing: map[string][]string{},
+		},
+		{
+			name: "duplicate references",
+			refs: map[string][]string{
+				config: {"one:latest", "one:v1", "two:latest"},
+			},
+			blobs: []blobInfo{
+				{key: configKey, size: 100},
+			},
+			want:        []blobInfo{},
+			wantMissing: map[string][]string{},
+		},
+		{
+			name: "unexpected blob key",
+			refs: map[string][]string{},
+			blobs: []blobInfo{
+				{key: "test/other/object", size: 100},
+			},
+			want:        []blobInfo{},
+			wantMissing: map[string][]string{},
+			wantErr:     true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := validateBlobs(tt.refs, tt.blobs, prefix)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("validateBlobs() error = nil, want error")
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("validateBlobs() error = %v", err)
+				}
+
+				if !slices.Equal(got.candidates, tt.want) {
+					t.Errorf("candidates = %v, want %v", got.candidates, tt.want)
+				}
+				if !reflect.DeepEqual(got.missing, tt.wantMissing) {
+					t.Errorf("missing = %v, want %v", got.missing, tt.wantMissing)
+				}
+			}
+		})
+	}
+}
+
+// validation run and results
+
+func TestFormatBlobValidation(t *testing.T) {
+	const prefix = "test/"
+	const (
+		digest1 = "sha256:111"
+		digest2 = "sha256:222"
+	)
+
+	tests := []struct {
+		name   string
+		result blobValidation
+		want   string
+	}{
+		{
+			name: "candidates and total size",
+			result: blobValidation{
+				candidates: []blobInfo{
+					{key: prefix + "blobs/" + digest1, size: 1024},
+					{key: prefix + "blobs/" + digest2, size: 2048},
+				},
+				missing: map[string][]string{},
+			},
+			want: "Unreferenced blobs:\n" +
+				"  " + digest1 + "  1024 bytes\n" +
+				"  " + digest2 + "  2048 bytes\n" +
+				"\n2 blobs, 3072 bytes reclaimable\n",
+		},
+		{
+			name: "missing references",
+			result: blobValidation{
+				missing: map[string][]string{
+					digest1: {"repo:latest", "repo:v1"},
+				},
+			},
+			want: "Unreferenced blobs:\n" +
+				"\n0 blobs, 0 bytes reclaimable\n" +
+				"\nMissing referenced blobs:\n" +
+				"  " + digest1 + "  referenced by repo:latest, repo:v1\n",
+		},
+		{
+			name: "empty result",
+			result: blobValidation{
+				missing: map[string][]string{},
+			},
+			want: "Unreferenced blobs:\n" +
+				"\n0 blobs, 0 bytes reclaimable\n",
+		},
+		{
+			name: "candidates and missing references",
+			result: blobValidation{
+				candidates: []blobInfo{
+					{key: prefix + "blobs/" + digest1, size: 512},
+				},
+				missing: map[string][]string{
+					digest2: {"repo:latest"},
+				},
+			},
+			want: "Unreferenced blobs:\n" +
+				"  " + digest1 + "  512 bytes\n" +
+				"\n1 blobs, 512 bytes reclaimable\n" +
+				"\nMissing referenced blobs:\n" +
+				"  " + digest2 + "  referenced by repo:latest\n",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			formatBlobValidation(&buf, tt.result, prefix)
+
+			if got := buf.String(); got != tt.want {
+				t.Errorf("formatBlobValidation() output:\n%s\nwant:\n%s", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestInspectBlobs(t *testing.T) {
+	const prefix = "test/"
+
+	config := "sha256:" + strings.Repeat("1", 64)
+	layer := "sha256:" + strings.Repeat("2", 64)
+	orphan := "sha256:" + strings.Repeat("3", 64)
+	tagKey := "test/repos/one/tags/latest"
+
+	tests := []struct {
+		name    string
+		tags    *fakeTagSource
+		blobs   *fakeBlobSource
+		want    blobValidation
+		wantErr bool
+	}{
+		{
+			name: "successful inspection",
+			tags: &fakeTagSource{
+				keys: []string{tagKey},
+				data: map[string][]byte{
+					tagKey: testManifest(config, layer),
+				},
+			},
+			blobs: &fakeBlobSource{
+				blobs: []blobInfo{
+					{key: prefix + "blobs/" + config, size: 100},
+					{key: prefix + "blobs/" + layer, size: 200},
+					{key: prefix + "blobs/" + orphan, size: 300},
+				},
+			},
+			want: blobValidation{
+				candidates: []blobInfo{
+					{key: prefix + "blobs/" + orphan, size: 300},
+				},
+				missing: map[string][]string{},
+			},
+		},
+		{
+			name: "empty storage",
+			tags: &fakeTagSource{
+				data: map[string][]byte{},
+			},
+			blobs: &fakeBlobSource{
+				blobs: []blobInfo{},
+			},
+			want: blobValidation{
+				missing: map[string][]string{},
+			},
+		},
+		{
+			name: "blob listing failure",
+			tags: &fakeTagSource{
+				data: map[string][]byte{},
+			},
+			blobs: &fakeBlobSource{
+				err: errors.New("listing failed"),
+			},
+			wantErr: true,
+		},
+		{
+			name: "tag discovery failure",
+			tags: &fakeTagSource{
+				listErr: errors.New("tag listing failed"),
+			},
+			blobs:   &fakeBlobSource{},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := inspectBlobs(context.Background(), tt.tags, tt.blobs, prefix)
+
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("inspectBlobs() error = nil, want error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("inspectBlobs() error = %v", err)
+			}
+
+			if !slices.Equal(got.candidates, tt.want.candidates) {
+				t.Errorf("candidates = %v, want %v", got.candidates, tt.want.candidates)
+			}
+			if !reflect.DeepEqual(got.missing, tt.want.missing) {
+				t.Errorf("missing = %v, want %v", got.missing, tt.want.missing)
+			}
+		})
+	}
+}
+
+func TestSameCandidates(t *testing.T) {
+	tests := []struct {
+		name string
+		a    []blobInfo
+		b    []blobInfo
+		want bool
+	}{
+		{
+			name: "identical",
+			a: []blobInfo{
+				{key: "blobs/a", size: 100},
+				{key: "blobs/b", size: 200},
+			},
+			b: []blobInfo{
+				{key: "blobs/a", size: 100},
+				{key: "blobs/b", size: 200},
+			},
+			want: true,
+		},
+		{
+			name: "different order",
+			a: []blobInfo{
+				{key: "blobs/a", size: 100},
+				{key: "blobs/b", size: 200},
+			},
+			b: []blobInfo{
+				{key: "blobs/b", size: 200},
+				{key: "blobs/a", size: 100},
+			},
+			want: true,
+		},
+		{
+			name: "candidate added",
+			a:    []blobInfo{{key: "blobs/a", size: 100}},
+			b: []blobInfo{
+				{key: "blobs/a", size: 100},
+				{key: "blobs/b", size: 200},
+			},
+			want: false,
+		},
+		{
+			name: "candidate removed",
+			a: []blobInfo{
+				{key: "blobs/a", size: 100},
+				{key: "blobs/b", size: 200},
+			},
+			b:    []blobInfo{{key: "blobs/a", size: 100}},
+			want: false,
+		},
+		{
+			name: "size changed",
+			a:    []blobInfo{{key: "blobs/a", size: 100}},
+			b:    []blobInfo{{key: "blobs/a", size: 101}},
+			want: false,
+		},
+		{
+			name: "empty sets",
+			a:    []blobInfo{},
+			b:    []blobInfo{},
+			want: true,
+		},
+		{
+			name: "duplicate key",
+			a: []blobInfo{
+				{key: "blobs/a", size: 100},
+				{key: "blobs/a", size: 100},
+			},
+			b:    []blobInfo{{key: "blobs/a", size: 100}},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := sameCandidates(tt.a, tt.b); got != tt.want {
+				t.Errorf("sameCandidates() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}

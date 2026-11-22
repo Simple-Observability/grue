@@ -19,12 +19,14 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 
 	"github.com/distribution/reference"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
+	"github.com/opencontainers/go-digest"
 	"golang.org/x/term"
 )
 
@@ -49,6 +51,8 @@ func main() {
 		cmdList()
 	case "rm":
 		cmdRemove()
+	case "prune":
+		cmdPrune()
 	case "-h", "--help", "help":
 		usage()
 	default:
@@ -66,7 +70,9 @@ Usage:
   grue push   <name[:tag]>  push a local image to the bucket
   grue pull   <name[:tag]>  pull an image from the bucket into Docker
   grue ls                   list repositories and tags
-  grue rm     <name[:tag]>   delete a tag (or all tags of a repo)
+  grue rm     <name[:tag]>  delete a tag (or all tags of a repo)
+  grue prune                identify unreferenced blobs (dry run)
+  grue prune --force        delete unreferenced blobs after confirmation
 
 Environment overrides (take precedence over the config file):
   GRUE_ENDPOINT, GRUE_REGION, GRUE_ACCESS_KEY, GRUE_SECRET_KEY, GRUE_BUCKET, GRUE_PREFIX
@@ -244,6 +250,10 @@ func (s *store) getTag(ctx context.Context, name, tag string) ([]byte, error) {
 
 func (s *store) deleteTag(ctx context.Context, name, tag string) error {
 	return s.client.RemoveObject(ctx, s.bucket, s.tagKey(name, tag), minio.RemoveObjectOptions{})
+}
+
+func (s *store) deleteBlob(ctx context.Context, key string) error {
+	return s.client.RemoveObject(ctx, s.bucket, key, minio.RemoveObjectOptions{})
 }
 
 // -----------------------------------------------------------------------------
@@ -1073,6 +1083,352 @@ func cmdRemove() {
 		}
 	}
 	fmt.Printf("Deleted %d tag(s) of %q (blobs retained).\n", len(keys), name)
+}
+
+// -----------------------------------------------------------------------------
+// prune
+// -----------------------------------------------------------------------------
+
+func cmdPrune() {
+	force := false
+
+	if len(os.Args) > 3 {
+		fatal("usage: grue prune [--force]")
+	}
+
+	if len(os.Args) == 3 {
+		switch os.Args[2] {
+		case "--force":
+			force = true
+		case "-h", "--help":
+			fmt.Println("usage: grue prune [--force]")
+			return
+		default:
+			fatal("usage: grue prune [--force]")
+		}
+	}
+
+	cfg, err := resolveConfig()
+	if err != nil {
+		fatal(fmt.Sprintf("prune: %v", err))
+	}
+
+	st, err := newStore(cfg)
+	if err != nil {
+		fatal(fmt.Sprintf("prune: %v", err))
+	}
+
+	result, err := inspectBlobs(context.Background(), st, st, st.prefix)
+	if err != nil {
+		fatal(fmt.Sprintf("prune: inspection failed: %v", err))
+	}
+
+	formatBlobValidation(os.Stdout, result, st.prefix)
+
+	if !force || len(result.candidates) == 0 {
+		return
+	}
+
+	prompt := fmt.Sprintf("Delete all %d unreferenced blob(s)?", len(result.candidates))
+	if !confirm(prompt) {
+		fmt.Println("aborted")
+		return
+	}
+
+	current, err := inspectBlobs(context.Background(), st, st, st.prefix)
+	if err != nil {
+		fatal(fmt.Sprintf("prune: revalidation failed: %v", err))
+	}
+
+	if !sameCandidates(result.candidates, current.candidates) {
+		fatal("prune: storage changed since inspection; no blobs deleted. Run prune again.")
+	}
+
+	deleteBlobs(context.Background(), st, current.candidates, st.prefix)
+}
+
+type tagSource interface {
+	listTagKeys(ctx context.Context) ([]string, error)
+	readTag(ctx context.Context, key string) ([]byte, error)
+}
+
+type blobInfo struct {
+	key  string
+	size int64
+}
+
+type blobSource interface {
+	listBlobs(ctx context.Context) ([]blobInfo, error)
+}
+
+type blobValidation struct {
+	candidates []blobInfo
+	missing    map[string][]string
+}
+
+func (s *store) listTagKeys(ctx context.Context) ([]string, error) {
+	prefix := s.prefix + "repos/"
+	ch := s.client.ListObjects(ctx, s.bucket, minio.ListObjectsOptions{
+		Prefix:    prefix,
+		Recursive: true,
+	})
+
+	var keys []string
+	for obj := range ch {
+		if obj.Err != nil {
+			return nil, fmt.Errorf("listing tag objects: %w", obj.Err)
+		}
+		keys = append(keys, obj.Key)
+	}
+
+	return keys, nil
+}
+
+func (s *store) readTag(ctx context.Context, key string) ([]byte, error) {
+	obj, err := s.client.GetObject(ctx, s.bucket, key, minio.GetObjectOptions{})
+	if err != nil {
+		return nil, err
+	}
+	defer obj.Close()
+
+	return io.ReadAll(obj)
+}
+
+func parseTagKey(prefix, key string) (name, tag string, err error) {
+	path := strings.TrimPrefix(key, prefix)
+	if path == key {
+		return "", "", fmt.Errorf("unexpected tag object key %q", key)
+	}
+
+	idx := strings.LastIndex(path, "/tags/")
+	if idx <= 0 || idx+len("/tags/") >= len(path) {
+		return "", "", fmt.Errorf("invalid tag object key %q", key)
+	}
+
+	name = path[:idx]
+	tag = path[idx+len("/tags/"):]
+
+	parsedName, parsedTag, hasTag, err := parseRef(name + ":" + tag)
+	if err != nil || !hasTag || parsedName != name || parsedTag != tag {
+		return "", "", fmt.Errorf("invalid tag object key %q", key)
+	}
+
+	return name, tag, nil
+}
+
+func discoverReferences(ctx context.Context, src tagSource, prefix string) (map[string][]string, error) {
+	keys, err := src.listTagKeys(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	refs := make(map[string][]string)
+	seen := make(map[string]map[string]bool)
+
+	for _, key := range keys {
+		name, tag, err := parseTagKey(prefix+"repos/", key)
+		if err != nil {
+			return nil, err
+		}
+
+		data, err := src.readTag(ctx, key)
+		if err != nil {
+			return nil, fmt.Errorf("reading %s: %w", key, err)
+		}
+
+		var manifest imageManifest
+		if err := json.Unmarshal(data, &manifest); err != nil {
+			return nil, fmt.Errorf("parsing %s: %w", key, err)
+		}
+
+		if manifest.SchemaVersion != 2 {
+			return nil, fmt.Errorf("invalid schema version in %s", key)
+		}
+		if manifest.MediaType != mediaTypeManifest {
+			return nil, fmt.Errorf("invalid media type in %s", key)
+		}
+
+		ref := name + ":" + tag
+		descriptors := append([]descriptor{manifest.Config}, manifest.Layers...)
+
+		for _, desc := range descriptors {
+			if desc.Digest == "" {
+				return nil, fmt.Errorf("missing digest in %s", key)
+			}
+
+			d, err := digest.Parse(desc.Digest)
+			if err != nil {
+				return nil, fmt.Errorf("invalid digest %q in %s", desc.Digest, key)
+			}
+
+			value := d.String()
+			if seen[value] == nil {
+				seen[value] = make(map[string]bool)
+			}
+			if !seen[value][ref] {
+				refs[value] = append(refs[value], ref)
+				seen[value][ref] = true
+			}
+		}
+	}
+
+	return refs, nil
+}
+
+func (s *store) listBlobs(ctx context.Context) ([]blobInfo, error) {
+	prefix := s.prefix + "blobs/"
+	ch := s.client.ListObjects(ctx, s.bucket, minio.ListObjectsOptions{
+		Prefix:    prefix,
+		Recursive: true,
+	})
+
+	var blobs []blobInfo
+	for obj := range ch {
+		if obj.Err != nil {
+			return nil, fmt.Errorf("listing blobs: %w", obj.Err)
+		}
+		blobs = append(blobs, blobInfo{
+			key:  obj.Key,
+			size: obj.Size,
+		})
+	}
+
+	return blobs, nil
+}
+
+func validateBlobs(refs map[string][]string, blobs []blobInfo, prefix string) (blobValidation, error) {
+	result := blobValidation{
+		missing: make(map[string][]string),
+	}
+
+	blobPrefix := prefix + "blobs/"
+	found := make(map[string]bool, len(blobs))
+
+	for _, blob := range blobs {
+		if !strings.HasPrefix(blob.key, blobPrefix) {
+			return blobValidation{}, fmt.Errorf("unexpected blob key %q", blob.key)
+		}
+
+		digest := strings.TrimPrefix(blob.key, blobPrefix)
+		if digest == "" {
+			return blobValidation{}, fmt.Errorf("empty digest in blob key %q", blob.key)
+		}
+
+		found[digest] = true
+
+		if _, referenced := refs[digest]; !referenced {
+			result.candidates = append(result.candidates, blob)
+		}
+	}
+
+	for digest, tags := range refs {
+		if !found[digest] {
+			result.missing[digest] = tags
+		}
+	}
+
+	return result, nil
+}
+
+func sameCandidates(a, b []blobInfo) bool {
+	if len(a) != len(b) {
+		return false
+	}
+
+	byKey := make(map[string]int64, len(a))
+	for _, blob := range a {
+		if _, exists := byKey[blob.key]; exists {
+			return false
+		}
+		byKey[blob.key] = blob.size
+	}
+
+	seen := make(map[string]bool, len(b))
+	for _, blob := range b {
+		if seen[blob.key] {
+			return false
+		}
+		seen[blob.key] = true
+
+		size, exists := byKey[blob.key]
+		if !exists || size != blob.size {
+			return false
+		}
+	}
+
+	return true
+}
+
+func formatBlobValidation(w io.Writer, result blobValidation, prefix string) {
+	fmt.Fprintln(w, "Unreferenced blobs:")
+
+	var total int64
+	for _, blob := range result.candidates {
+		digest := strings.TrimPrefix(blob.key, prefix+"blobs/")
+		fmt.Fprintf(w, "  %s  %d bytes\n", digest, blob.size)
+		total += blob.size
+	}
+
+	fmt.Fprintf(w, "\n%d blobs, %d bytes reclaimable\n",
+		len(result.candidates), total)
+
+	if len(result.missing) == 0 {
+		return
+	}
+
+	fmt.Fprintln(w, "\nMissing referenced blobs:")
+
+	digests := make([]string, 0, len(result.missing))
+	for digest := range result.missing {
+		digests = append(digests, digest)
+	}
+	sort.Strings(digests)
+
+	for _, digest := range digests {
+		tags := slices.Clone(result.missing[digest])
+		sort.Strings(tags)
+
+		fmt.Fprintf(w, "  %s  referenced by %s\n",
+			digest, strings.Join(tags, ", "))
+	}
+}
+
+func inspectBlobs(ctx context.Context, tags tagSource, blobs blobSource, prefix string) (blobValidation, error) {
+	refs, err := discoverReferences(ctx, tags, prefix)
+	if err != nil {
+		return blobValidation{}, err
+	}
+
+	listed, err := blobs.listBlobs(ctx)
+	if err != nil {
+		return blobValidation{}, fmt.Errorf("listing blobs: %w", err)
+	}
+
+	return validateBlobs(refs, listed, prefix)
+}
+
+func deleteBlobs(ctx context.Context, st *store, candidates []blobInfo, prefix string) {
+	candidates = slices.Clone(candidates)
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].key < candidates[j].key
+	})
+
+	var deleted, failed int
+
+	for _, blob := range candidates {
+		digest := strings.TrimPrefix(blob.key, prefix+"blobs/")
+
+		if err := st.deleteBlob(ctx, blob.key); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to delete %s: %v\n", digest, err)
+			failed++
+			continue
+		}
+
+		fmt.Fprintf(os.Stdout, "Deleted %s\n", digest)
+		deleted++
+	}
+
+	fmt.Fprintf(os.Stdout, "\n%d blobs deleted, %d failed\n", deleted, failed)
 }
 
 // -----------------------------------------------------------------------------
