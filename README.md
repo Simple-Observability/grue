@@ -14,7 +14,7 @@ Why run a container registry when you already have a S3?
 
 `grue` is a CLI that turns any S3-compatible bucket into a container registry. It pushes and pulls Docker images directly to and from object storage. You can use Cloudflare R2, AWS S3, MinIO, Backblaze B2, or another S3-compatible store. Authentication uses your S3 API keys.
 
-The whole program is one file, `grue.go`, and under 1000 lines of code.
+The whole program is one file, `grue.go`, and under ~~1000~~ 1500 lines of code.
 
 ### Commands
 
@@ -23,6 +23,7 @@ The whole program is one file, `grue.go`, and under 1000 lines of code.
 - `grue pull <name[:tag]>` - pull an image from the bucket into Docker
 - `grue ls` - list repositories and tags
 - `grue rm <name[:tag]>` - delete a tag, or all tags of a repository
+- `grue prune [--force]` - identify unreferenced blobs for deletion and report missing referenced blobs
 
 ### Usage
 
@@ -63,6 +64,20 @@ Delete all tags of a repository:
 ```bash
 grue rm my-image
 ```
+
+Preview unreferenced and missing blobs:
+
+```bash
+grue prune
+```
+
+Delete unreferenced blobs:
+
+```bash
+grue prune --force
+```
+
+The command displays the orphaned blobs and their total size before asking for confirmation.
 
 ### Configuration
 
@@ -126,5 +141,30 @@ These inputs control the S3 connection and the grue binary. Build inputs are the
 
 ### Limitations
 
-- **No blob garbage collection.** `rm` deletes tags only; the blobs they referenced are retained. A future `gc`/`prune` command is planned.
 - **One platform per tag.** The action builds one platform at a time. grue stores one image per tag. There is no multi-arch index.
+
+- **Concurrent writes during pruning.** Do not run `prune` concurrently with `push` or `rm`. Prune performs a second inspection before deletion to detect changes, but object storage does not provide an atomic transaction across reference discovery and blob deletion. A concurrent push could create a reference after revalidation but before deletion.
+
+- **Partial deletion failures.** Blobs are deleted individually. If some deletions fail, successful deletions are not rolled back. Run `prune` again to identify and retry remaining orphaned blobs.
+
+### Garbage Collection
+
+Deleting an image tag with `rm` does not delete its associated blobs. This avoids accidentally removing blobs shared by other tags.
+
+Use `prune` to identify and remove blobs that are no longer referenced by any tag.
+
+By default, `prune` performs a dry run. It reports:
+
+- Unreferenced blobs that can be deleted.
+- The number of candidate blobs and their total size.
+- Missing blobs still referenced by existing tags.
+
+To delete candidates, use `--force`. This enables deletion but does not bypass the confirmation prompt.
+
+Before deleting anything, grue repeats the inspection and compares the candidate object keys and sizes with the original results. If the candidate set has changed, deletion is aborted and the command must be run again.
+
+Missing referenced blobs are informational. They do not prevent deletion of unrelated orphaned blobs. They may indicate an incomplete image upload or a previously deleted blob.
+
+Deletion is performed one blob at a time. Individual failures are reported, and grue continues attempting the remaining candidates. Successfully deleted blobs are not restored if another deletion fails. Run `prune` again to retry remaining candidates.
+
+**Important:** Avoid concurrent `push`, `rm`, and `prune` operations. Revalidation reduces the risk of deleting newly referenced blobs but cannot eliminate races between object-storage operations.
